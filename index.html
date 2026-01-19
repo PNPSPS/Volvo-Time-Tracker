@@ -1,367 +1,888 @@
-<!DOCTYPE html>
-<html lang="th">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Volvo Service Tracker</title>
+import React, { useState, useEffect } from 'react';
+import { 
+  Clock, Play, Square, History, User, CheckCircle, AlertCircle, 
+  Trash2, BarChart3, Timer, Users, Wifi, WifiOff, Loader2, 
+  Settings, Save, LogOut, Database, Hourglass, Search, Download 
+} from 'lucide-react';
+
+// --- Firebase Imports ---
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { 
+  getFirestore, collection, doc, setDoc, addDoc, updateDoc, 
+  onSnapshot, deleteDoc, writeBatch 
+} from 'firebase/firestore';
+
+// --- Global Variables for Firebase Instances ---
+let app;
+let auth;
+let db;
+
+// --- Helper: Initialize Firebase ---
+const initFirebase = (configStr) => {
+  try {
+    // Check if configStr is already an object or needs parsing
+    const config = typeof configStr === 'string' ? JSON.parse(configStr) : configStr;
     
-    <!-- 1. โหลดเครื่องมือที่จำเป็น (React, Tailwind, Firebase) จาก CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    // Prevent duplicate initialization
+    if (!getApps().length) {
+      app = initializeApp(config);
+    } else {
+      app = getApp(); // Use existing default app if available
+    }
+    auth = getAuth(app);
+    db = getFirestore(app);
+    return true;
+  } catch (error) {
+    console.error("Firebase Init Error:", error);
+    return false;
+  }
+};
+
+const TechnicianTimeTracker = () => {
+  // --- State Management ---
+  const [isConfigured, setIsConfigured] = useState(false);
+  const [showSetup, setShowSetup] = useState(false);
+  const [configInput, setConfigInput] = useState('');
+  
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [technicians, setTechnicians] = useState([]);
+  const [workLogs, setWorkLogs] = useState([]);
+  
+  // UI States
+  const [selectedTechId, setSelectedTechId] = useState(null);
+  const [partnerId, setPartnerId] = useState('');
+  const [jobInput, setJobInput] = useState('');
+  const [stdTimeInput, setStdTimeInput] = useState('');
+  const [activeTab, setActiveTab] = useState('tracker'); 
+  const [currentTime, setCurrentTime] = useState(new Date());
+
+  // Search & Filter State
+  const [searchTerm, setSearchTerm] = useState('');
+
+  // --- CRITICAL FIX: Use Dynamic App ID ---
+  // Use the environment's App ID to match permission rules
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'volvo-service-tracker';
+
+  // --- 1. Initial System Check (Run Once) ---
+  useEffect(() => {
+    const checkConfig = async () => {
+      // Priority 1: Environment Variable (Canvas Environment)
+      if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+        if (initFirebase(__firebase_config)) {
+          setIsConfigured(true);
+          handleAuth();
+          return;
+        }
+      }
+
+      // Priority 2: Local Storage (Manual Setup)
+      const savedConfig = localStorage.getItem('volvo_firebase_config');
+      if (savedConfig) {
+        if (initFirebase(savedConfig)) {
+          setIsConfigured(true);
+          handleAuth();
+          return;
+        }
+      }
+
+      // No config found
+      setLoading(false);
+      setShowSetup(true);
+    };
+
+    checkConfig();
+  }, []);
+
+  // --- 2. Authentication Logic ---
+  const handleAuth = async () => {
+    setLoading(true);
+    try {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    } catch (error) {
+      console.error("Auth Error:", error);
+      setLoading(false);
+    }
     
-    <!-- Firebase Compat Library (เพื่อให้ทำงานในไฟล์เดียวได้ง่าย) -->
-    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    // Listen to Auth State
+    onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setLoading(false);
+    });
+  };
 
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-    </style>
-</head>
-<body class="bg-slate-50 text-slate-800">
+  // --- 3. Data Synchronization (Real-time) ---
+  useEffect(() => {
+    if (!user || !db) return;
 
-    <div id="root"></div>
+    // A. Sync Technicians
+    const techsRef = collection(db, 'artifacts', appId, 'public', 'data', 'technicians');
+    const unsubTechs = onSnapshot(techsRef, (snapshot) => {
+      const loadedTechs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      if (loadedTechs.length === 0) {
+        seedDefaultTechnicians();
+      } else {
+        setTechnicians(loadedTechs.sort((a, b) => parseInt(a.id) - parseInt(b.id)));
+      }
+    }, (error) => console.error("Techs Sync Error:", error));
 
-    <!-- 2. ส่วนของโค้ดโปรแกรม -->
-    <script type="text/babel">
-        const { useState, useEffect } = React;
+    // B. Sync Work Logs
+    const logsRef = collection(db, 'artifacts', appId, 'public', 'data', 'work_logs');
+    const unsubLogs = onSnapshot(logsRef, (snapshot) => {
+      const loadedLogs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setWorkLogs(loadedLogs.sort((a, b) => b.createdAt - a.createdAt));
+    }, (error) => console.error("Logs Sync Error:", error));
 
-        // --- Icons (SVG) เพื่อไม่ต้องลงโปรแกรมเพิ่ม ---
-        const Icons = {
-            Clock: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
-            History: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>,
-            BarChart3: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>,
-            User: () => <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>,
-            Play: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>,
-            Square: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>,
-            Trash2: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>,
-            Settings: () => <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.47a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>,
-            Save: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>,
-            Wifi: () => <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>,
-            Users: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        };
+    return () => {
+      unsubTechs();
+      unsubLogs();
+    };
+  }, [user]);
 
-        // --- Main Component ---
-        const TechnicianTimeTracker = () => {
-            const [isConfigured, setIsConfigured] = useState(false);
-            const [configInput, setConfigInput] = useState('');
-            const [user, setUser] = useState(null);
-            const [technicians, setTechnicians] = useState([]);
-            const [workLogs, setWorkLogs] = useState([]);
-            const [loading, setLoading] = useState(true);
+  // --- 4. Clock Effect ---
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // --- Helpers & Actions ---
+  const handleSaveConfig = () => {
+    if (!configInput.trim()) return;
+    try {
+      // Validate JSON
+      JSON.parse(configInput);
+      localStorage.setItem('volvo_firebase_config', configInput);
+      window.location.reload(); // Reload to initialize with new config
+    } catch (e) {
+      alert("Format JSON ไม่ถูกต้อง กรุณาตรวจสอบอีกครั้ง");
+    }
+  };
+
+  const handleResetConfig = () => {
+    if(confirm("คุณต้องการรีเซ็ตการตั้งค่าการเชื่อมต่อใช่หรือไม่?")) {
+      localStorage.removeItem('volvo_firebase_config');
+      window.location.reload();
+    }
+  };
+
+  const seedDefaultTechnicians = async () => {
+    const defaultTechs = [
+      { id: '1', name: 'PST Thanawut', status: 'idle', currentJob: '', startTime: null, stdTime: 0 },
+      { id: '2', name: 'PST Naroot', status: 'idle', currentJob: '', startTime: null, stdTime: 0 },
+      { id: '3', name: 'PST Chayaphon', status: 'idle', currentJob: '', startTime: null, stdTime: 0 },
+      { id: '4', name: 'PST Ponrphot', status: 'idle', currentJob: '', startTime: null, stdTime: 0 },
+    ];
+    
+    const batch = writeBatch(db);
+    defaultTechs.forEach(tech => {
+      const ref = doc(db, 'artifacts', appId, 'public', 'data', 'technicians', tech.id);
+      batch.set(ref, tech);
+    });
+    await batch.commit();
+  };
+
+  // --- Time Helpers ---
+  const calculateDurationMinutes = (start, end) => Math.floor((new Date(end) - new Date(start)) / 60000);
+  const formatDuration = (minutes) => `${Math.floor(minutes / 60)} ชม. ${minutes % 60} นาที`;
+  const getElapsedTimeObj = (startTime) => {
+    if (!startTime) return { totalMinutes: 0, text: "00:00:00" };
+    const diff = currentTime - new Date(startTime);
+    const totalMinutes = Math.floor(diff / 60000);
+    const hours = Math.floor(diff / 3600000);
+    const minutes = Math.floor((diff % 3600000) / 60000);
+    const seconds = Math.floor((diff % 60000) / 1000);
+    return {
+      totalMinutes,
+      text: `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+    };
+  };
+
+  // Helper to calculate remaining time text
+  const getRemainingTimeText = (stdTimeHours, elapsedMinutes, isPair) => {
+      if (!stdTimeHours || stdTimeHours <= 0) return null;
+      const stdMinutes = stdTimeHours * 60;
+      const remaining = Math.round(stdMinutes - elapsedMinutes);
+      
+      if (remaining < 0) {
+          return { text: `เกินเวลา ${Math.abs(remaining)} นาที`, isOver: true, minutes: remaining };
+      }
+      return { text: `เหลือ ${remaining} นาที`, isOver: false, minutes: remaining };
+  };
+
+  // --- Export & Filter ---
+  const handleExportCSV = () => {
+    // 1. Create CSV Header
+    const headers = "Date,Technician,Partner,Job No,Start Time,End Time,Actual (Mins),Std Time (Hrs),Efficiency,Type\n";
+    
+    // 2. Map Data
+    const rows = workLogs.map(log => {
+      const startTime = new Date(log.startTime).toLocaleTimeString('th-TH');
+      const endTime = new Date(log.endTime).toLocaleTimeString('th-TH');
+      const type = log.isPair ? "Pair" : "Solo";
+      const partner = log.partnerName || "-";
+      
+      return `${log.date},${log.techName},${partner},${log.jobNo},${startTime},${endTime},${log.actualMinutes},${log.stdTime || 0},${log.efficiency}%,${type}`;
+    }).join("\n");
+
+    // 3. Create File with BOM for Thai support
+    const csvContent = "\uFEFF" + headers + rows;
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    
+    // 4. Trigger Download
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `volvo_logs_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const filteredLogs = workLogs.filter(log => 
+    log.jobNo.toLowerCase().includes(searchTerm.toLowerCase()) || 
+    log.techName.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    (log.partnerName && log.partnerName.toLowerCase().includes(searchTerm.toLowerCase())) ||
+    log.date.includes(searchTerm)
+  );
+
+  // --- Job Actions ---
+  const handleStartJob = async () => {
+    if (!user || !jobInput.trim()) return;
+
+    let stdTimeTotal = stdTimeInput && !isNaN(parseFloat(stdTimeInput)) ? parseFloat(stdTimeInput) : 0;
+    const isPairJob = partnerId !== '';
+    const stdTimePerPerson = isPairJob ? (stdTimeTotal / 2) : stdTimeTotal;
+    const startTime = new Date().toISOString();
+
+    const selectedTech = technicians.find(t => t.id === selectedTechId);
+    const partnerTech = isPairJob ? technicians.find(t => t.id === partnerId) : null;
+
+    const batch = writeBatch(db);
+
+    // Update Selected Tech
+    const selectedRef = doc(db, 'artifacts', appId, 'public', 'data', 'technicians', selectedTechId);
+    batch.update(selectedRef, {
+        status: 'working',
+        currentJob: jobInput,
+        startTime: startTime,
+        stdTime: stdTimePerPerson,
+        isPair: isPairJob,
+        partnerName: partnerTech ? partnerTech.name : null
+    });
+
+    // Update Partner Tech
+    if (partnerTech) {
+       const partnerRef = doc(db, 'artifacts', appId, 'public', 'data', 'technicians', partnerId);
+       batch.update(partnerRef, {
+           status: 'working',
+           currentJob: jobInput,
+           startTime: startTime,
+           stdTime: stdTimePerPerson,
+           isPair: isPairJob,
+           partnerName: selectedTech.name
+       });
+    }
+
+    await batch.commit();
+
+    setJobInput('');
+    setStdTimeInput('');
+    setPartnerId('');
+  };
+
+  const handleStopJob = async () => {
+    if (!user) return;
+    const tech = technicians.find(t => t.id === selectedTechId);
+    if (!tech) return;
+
+    const endTime = new Date().toISOString();
+    const actualMinutes = calculateDurationMinutes(tech.startTime, endTime);
+    const stdMinutes = tech.stdTime * 60;
+    
+    let efficiency = 0;
+    if (actualMinutes > 0 && stdMinutes > 0) {
+      efficiency = Math.round((stdMinutes / actualMinutes) * 100);
+    } else if (stdMinutes > 0 && actualMinutes === 0) {
+        efficiency = 100;
+    }
+
+    const newLog = {
+      techId: tech.id,
+      techName: tech.name,
+      jobNo: tech.currentJob,
+      startTime: tech.startTime,
+      endTime: endTime,
+      durationText: formatDuration(actualMinutes),
+      actualMinutes: actualMinutes,
+      stdTime: tech.stdTime,
+      efficiency: efficiency,
+      isPair: tech.isPair || false,
+      partnerName: tech.partnerName || null,
+      date: new Date().toLocaleDateString('th-TH'),
+      createdAt: Date.now()
+    };
+
+    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'work_logs'), newLog);
+
+    const techRef = doc(db, 'artifacts', appId, 'public', 'data', 'technicians', tech.id);
+    await updateDoc(techRef, {
+        status: 'idle',
+        currentJob: '',
+        startTime: null,
+        stdTime: 0,
+        isPair: false,
+        partnerName: null
+    });
+  };
+
+  const clearLogs = async () => {
+    if(!user) return;
+    if(window.confirm('ยืนยันลบประวัติทั้งหมด? (การลบจะส่งผลต่อทุกเครื่อง)')) {
+        const batch = writeBatch(db);
+        workLogs.forEach(log => {
+            const ref = doc(db, 'artifacts', appId, 'public', 'data', 'work_logs', log.id);
+            batch.delete(ref);
+        });
+        await batch.commit();
+    }
+  };
+
+  // --- Setup Screen Component ---
+  if (!isConfigured || showSetup) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans">
+        <div className="bg-white max-w-md w-full rounded-xl shadow-lg border border-slate-200 overflow-hidden">
+          <div className="bg-blue-800 p-6 text-white text-center">
+             <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center text-blue-800 text-3xl font-bold mx-auto mb-4">V</div>
+             <h2 className="text-xl font-bold">System Setup</h2>
+             <p className="text-blue-200 text-sm">Volvo Service Tracker Config</p>
+          </div>
+          <div className="p-6 space-y-4">
+            <div className="text-sm text-slate-600">
+               <p className="mb-2">กรุณาระบุ <strong>Firebase Config (JSON)</strong> เพื่อเชื่อมต่อระบบ Cloud Database</p>
+               <div className="bg-slate-50 p-3 rounded border border-slate-200 text-xs font-mono text-slate-500 mb-4">
+                 Example:<br/>
+                 {`{"apiKey": "AIza...", "authDomain": "...", "projectId": "..."}`}
+               </div>
+            </div>
+            <textarea
+               className="w-full h-40 p-3 border border-slate-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 outline-none"
+               placeholder="วางโค้ด Config ที่นี่..."
+               value={configInput}
+               onChange={(e) => setConfigInput(e.target.value)}
+            ></textarea>
+            <button 
+              onClick={handleSaveConfig}
+              className="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all"
+            >
+              <Save size={18} /> บันทึกและเริ่มใช้งาน
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Loading Screen ---
+  if (loading) {
+      return (
+          <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-400 gap-2 font-sans">
+              <Loader2 className="animate-spin" /> กำลังเชื่อมต่อระบบ Cloud...
+          </div>
+      );
+  }
+
+  // --- Main App ---
+  const selectedTech = technicians.find(t => t.id === selectedTechId);
+  const idleTechnicians = technicians.filter(t => t.status === 'idle' && t.id !== selectedTechId);
+
+  return (
+    <div className="min-h-screen bg-slate-50 font-sans text-slate-800">
+      {/* Header */}
+      <header className="bg-white shadow-sm sticky top-0 z-10">
+        <div className="max-w-4xl mx-auto px-4 py-4 flex justify-between items-center">
+          <div>
+            <h1 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+              <div className="w-8 h-8 bg-blue-700 rounded-full flex items-center justify-center text-white">V</div>
+              Volvo Service Tracker
+            </h1>
+            <p className="text-xs text-slate-500 flex items-center gap-1">
+                {user ? <Wifi size={12} className="text-green-500"/> : <WifiOff size={12} className="text-red-500"/>}
+                ระบบออนไลน์ (Cloud Database)
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+             <div className="text-right hidden sm:block">
+                <div className="text-lg font-mono font-medium text-blue-700">
+                {currentTime.toLocaleTimeString('th-TH')}
+                </div>
+                <div className="text-xs text-slate-400">
+                {currentTime.toLocaleDateString('th-TH', { weekday: 'long', day: 'numeric', month: 'long' })}
+                </div>
+            </div>
+            <button 
+              onClick={handleResetConfig}
+              className="p-2 text-slate-300 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-all"
+              title="ตั้งค่าการเชื่อมต่อ"
+            >
+              <Settings size={20} />
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="max-w-4xl mx-auto p-4 pb-24">
+        
+        {/* Navigation Tabs */}
+        <div className="flex gap-2 mb-6 bg-white p-1 rounded-lg shadow-sm border border-slate-100">
+          <button 
+            onClick={() => setActiveTab('tracker')}
+            className={`flex-1 py-2 rounded-md text-sm font-medium transition-all flex justify-center items-center gap-2 ${activeTab === 'tracker' ? 'bg-blue-50 text-blue-700 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}
+          >
+            <Clock size={16} /> จับเวลา
+          </button>
+          <button 
+            onClick={() => setActiveTab('history')}
+            className={`flex-1 py-2 rounded-md text-sm font-medium transition-all flex justify-center items-center gap-2 ${activeTab === 'history' ? 'bg-blue-50 text-blue-700 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}
+          >
+            <History size={16} /> ประวัติงาน
+          </button>
+          <button 
+            onClick={() => setActiveTab('dashboard')}
+            className={`flex-1 py-2 rounded-md text-sm font-medium transition-all flex justify-center items-center gap-2 ${activeTab === 'dashboard' ? 'bg-blue-50 text-blue-700 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}
+          >
+            <BarChart3 size={16} /> สรุปผล
+          </button>
+        </div>
+
+        {activeTab === 'tracker' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             
-            const [selectedTechId, setSelectedTechId] = useState(null);
-            const [partnerId, setPartnerId] = useState('');
-            const [jobInput, setJobInput] = useState('');
-            const [stdTimeInput, setStdTimeInput] = useState('');
-            const [activeTab, setActiveTab] = useState('tracker');
-            const [currentTime, setCurrentTime] = useState(new Date());
+            {/* Left: Technician List */}
+            <div className="space-y-4">
+              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">รายชื่อช่าง (PST)</h2>
+              <div className="grid grid-cols-1 gap-3">
+                {technicians.map(tech => {
+                  const elapsedTimeObj = tech.status === 'working' ? getElapsedTimeObj(tech.startTime) : null;
+                  const remainingObj = tech.status === 'working' ? getRemainingTimeText(tech.stdTime, elapsedTimeObj.totalMinutes, tech.isPair) : null;
+                  const isOverTime = tech.status === 'working' && tech.stdTime > 0 && elapsedTimeObj.totalMinutes > (tech.stdTime * 60);
 
-            const appId = 'volvo-service-tracker-web';
-
-            // --- 1. Init System ---
-            useEffect(() => {
-                const savedConfig = localStorage.getItem('volvo_firebase_config');
-                if (savedConfig) {
-                    try {
-                        const config = JSON.parse(savedConfig);
-                        if (!firebase.apps.length) {
-                            firebase.initializeApp(config);
-                        }
-                        setIsConfigured(true);
-                        handleAuth();
-                    } catch (e) {
-                        console.error("Config Error", e);
-                        setLoading(false);
-                    }
-                } else {
-                    setLoading(false);
-                }
-            }, []);
-
-            // --- 2. Auth ---
-            const handleAuth = () => {
-                setLoading(true);
-                firebase.auth().signInAnonymously().catch(console.error);
-                firebase.auth().onAuthStateChanged((u) => {
-                    setUser(u);
-                    setLoading(false);
-                });
-            };
-
-            // --- 3. Realtime Sync ---
-            useEffect(() => {
-                if (!user || !isConfigured) return;
-                const db = firebase.firestore();
-
-                // Techs
-                const unsubTechs = db.collection('artifacts').doc(appId).collection('technicians')
-                    .onSnapshot(snap => {
-                        const loaded = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                        if(loaded.length === 0) seedDefaultTechnicians();
-                        else setTechnicians(loaded.sort((a,b) => parseInt(a.id) - parseInt(b.id)));
-                    });
-
-                // Logs
-                const unsubLogs = db.collection('artifacts').doc(appId).collection('work_logs')
-                    .onSnapshot(snap => {
-                        const loaded = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                        setWorkLogs(loaded.sort((a,b) => b.createdAt - a.createdAt));
-                    });
-
-                return () => { unsubTechs(); unsubLogs(); };
-            }, [user, isConfigured]);
-
-             useEffect(() => {
-                const timer = setInterval(() => setCurrentTime(new Date()), 1000);
-                return () => clearInterval(timer);
-            }, []);
-
-            // --- Actions ---
-            const handleSaveConfig = () => {
-                try {
-                    JSON.parse(configInput);
-                    localStorage.setItem('volvo_firebase_config', configInput);
-                    window.location.reload();
-                } catch(e) { alert("Config ไม่ถูกต้อง"); }
-            };
-
-             const handleResetConfig = () => {
-                if(confirm("รีเซ็ตการตั้งค่า?")) {
-                    localStorage.removeItem('volvo_firebase_config');
-                    window.location.reload();
-                }
-            };
-
-            const seedDefaultTechnicians = () => {
-                const db = firebase.firestore();
-                const batch = db.batch();
-                const defaultTechs = [
-                    { id: '1', name: 'PST Thanawut' },
-                    { id: '2', name: 'PST Naroot' },
-                    { id: '3', name: 'PST Chayaphon' },
-                    { id: '4', name: 'PST Ponrphot' }
-                ];
-                defaultTechs.forEach(t => {
-                    const ref = db.collection('artifacts').doc(appId).collection('technicians').doc(t.id);
-                    batch.set(ref, { ...t, status: 'idle', currentJob: '', startTime: null, stdTime: 0 });
-                });
-                batch.commit();
-            };
-
-            const handleStartJob = () => {
-                if (!jobInput.trim()) return;
-                const db = firebase.firestore();
-                const batch = db.batch();
-                
-                let std = parseFloat(stdTimeInput) || 0;
-                const isPair = partnerId !== '';
-                const stdPerPerson = isPair ? std/2 : std;
-                const start = new Date().toISOString();
-
-                [selectedTechId, partnerId].filter(Boolean).forEach(id => {
-                    const ref = db.collection('artifacts').doc(appId).collection('technicians').doc(id);
-                    batch.update(ref, { status: 'working', currentJob: jobInput, startTime: start, stdTime: stdPerPerson, isPair });
-                });
-                batch.commit();
-                setJobInput(''); setStdTimeInput(''); setPartnerId('');
-            };
-
-            const handleStopJob = () => {
-                const tech = technicians.find(t => t.id === selectedTechId);
-                const db = firebase.firestore();
-                const end = new Date().toISOString();
-                const start = new Date(tech.startTime);
-                const diffMs = new Date(end) - start;
-                const mins = Math.floor(diffMs / 60000);
-                const stdMins = tech.stdTime * 60;
-                
-                let eff = 0;
-                if(mins > 0 && stdMins > 0) eff = Math.round((stdMins/mins)*100);
-                else if(stdMins > 0) eff = 100;
-
-                const hrs = Math.floor(mins/60);
-                const mn = mins%60;
-                const durText = `${hrs} ชม. ${mn} นาที`;
-
-                db.collection('artifacts').doc(appId).collection('work_logs').add({
-                    techId: tech.id, techName: tech.name, jobNo: tech.currentJob,
-                    startTime: tech.startTime, endTime: end, durationText: durText,
-                    actualMinutes: mins, stdTime: tech.stdTime, efficiency: eff,
-                    date: new Date().toLocaleDateString('th-TH'), createdAt: Date.now()
-                });
-
-                db.collection('artifacts').doc(appId).collection('technicians').doc(tech.id).update({
-                    status: 'idle', currentJob: '', startTime: null, stdTime: 0, isPair: false
-                });
-            };
-
-             const clearLogs = () => {
-                if(confirm("ลบประวัติทั้งหมด?")) {
-                    const db = firebase.firestore();
-                    workLogs.forEach(l => db.collection('artifacts').doc(appId).collection('work_logs').doc(l.id).delete());
-                }
-            };
-
-            // --- Render ---
-            if (!isConfigured) {
-                return (
-                    <div className="min-h-screen flex items-center justify-center bg-slate-100 p-4">
-                        <div className="bg-white p-8 rounded-xl shadow-lg max-w-md w-full">
-                            <h2 className="text-2xl font-bold text-blue-800 mb-4 text-center">System Setup</h2>
-                            <textarea 
-                                className="w-full h-32 p-3 border rounded mb-4 text-sm font-mono" 
-                                placeholder='วาง Firebase Config ที่นี่...'
-                                value={configInput} onChange={e => setConfigInput(e.target.value)}
-                            ></textarea>
-                            <button onClick={handleSaveConfig} className="w-full bg-blue-600 text-white py-3 rounded-lg font-bold">บันทึก</button>
-                        </div>
-                    </div>
-                );
-            }
-
-            if (loading) return <div className="p-10 text-center">กำลังเชื่อมต่อ...</div>;
-
-            const selectedTech = technicians.find(t => t.id === selectedTechId);
-            const idleTechs = technicians.filter(t => t.status === 'idle' && t.id !== selectedTechId);
-
-            // Time Helper
-            const getElapsed = (start) => {
-                if(!start) return "00:00:00";
-                const diff = currentTime - new Date(start);
-                const h = Math.floor(diff/3600000).toString().padStart(2,'0');
-                const m = Math.floor((diff%3600000)/60000).toString().padStart(2,'0');
-                const s = Math.floor((diff%60000)/1000).toString().padStart(2,'0');
-                return `${h}:${m}:${s}`;
-            };
-
-            return (
-                <div className="max-w-4xl mx-auto p-4 pb-24">
-                     <header className="flex justify-between items-center mb-6 bg-white p-4 rounded-xl shadow-sm">
-                        <div>
-                            <h1 className="text-xl font-bold text-slate-800 flex items-center gap-2">
-                                <span className="w-8 h-8 bg-blue-700 rounded-full flex items-center justify-center text-white">V</span>
-                                Volvo Tracker
-                            </h1>
-                            <p className="text-xs text-green-600 flex items-center gap-1"><Icons.Wifi/> Online</p>
-                        </div>
+                  return (
+                    <button
+                      key={tech.id}
+                      onClick={() => {
+                          setSelectedTechId(tech.id);
+                          setPartnerId(''); 
+                          setJobInput(''); 
+                          setStdTimeInput('');
+                      }}
+                      className={`p-4 rounded-xl border text-left transition-all relative overflow-hidden ${
+                        selectedTechId === tech.id 
+                          ? 'border-blue-500 ring-2 ring-blue-100 bg-white shadow-md' 
+                          : 'border-slate-200 bg-white hover:border-blue-300'
+                      }`}
+                    >
+                      <div className="flex justify-between items-start mb-2">
                         <div className="flex items-center gap-3">
-                            <div className="text-right hidden sm:block">
-                                <div className="text-lg font-mono font-medium text-blue-700">{currentTime.toLocaleTimeString('th-TH')}</div>
-                            </div>
-                            <button onClick={handleResetConfig} className="text-slate-300 hover:text-slate-600"><Icons.Settings/></button>
+                          <div className={`w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold border-2 ${tech.status === 'working' ? 'bg-green-100 text-green-700 border-green-200' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
+                            {tech.name.split(' ')[1]?.charAt(0) || 'P'}
+                          </div>
+                          <div>
+                            <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                                {tech.name}
+                                {tech.isPair && <Users size={14} className="text-blue-500" />}
+                            </h3>
+                            {tech.partnerName && (
+                                <p className="text-xs text-slate-500 flex items-center gap-1">
+                                    <Users size={10} className="inline"/> คู่กับ: {tech.partnerName.split(' ')[1] || tech.partnerName}
+                                </p>
+                            )}
+                            {!tech.partnerName && (
+                                <span className={`text-xs px-2 py-0.5 rounded-full inline-block mt-1 ${tech.status === 'working' ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>
+                                {tech.status === 'working' ? 'กำลังทำงาน' : 'ว่าง'}
+                                </span>
+                            )}
+                          </div>
                         </div>
-                    </header>
-
-                    <div className="flex gap-2 mb-6">
-                        {['tracker', 'history', 'dashboard'].map(tab => (
-                            <button key={tab} onClick={() => setActiveTab(tab)} 
-                                className={`flex-1 py-3 rounded-lg text-sm font-bold capitalize flex items-center justify-center gap-2 ${activeTab === tab ? 'bg-blue-50 text-blue-700' : 'bg-white text-slate-500'}`}>
-                                {tab === 'tracker' && <Icons.Clock/>}
-                                {tab === 'history' && <Icons.History/>}
-                                {tab === 'dashboard' && <Icons.BarChart3/>}
-                                {tab}
-                            </button>
-                        ))}
-                    </div>
-
-                    {activeTab === 'tracker' && (
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div className="space-y-3">
-                                {technicians.map(tech => (
-                                    <button key={tech.id} onClick={() => { setSelectedTechId(tech.id); setJobInput(''); setStdTimeInput(''); setPartnerId(''); }}
-                                        className={`w-full p-4 rounded-xl border text-left transition-all relative ${selectedTechId === tech.id ? 'border-blue-500 ring-2 ring-blue-100 bg-white' : 'border-white bg-white hover:border-blue-200'}`}>
-                                        <div className="flex justify-between items-start">
-                                            <div className="flex items-center gap-3">
-                                                <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold ${tech.status === 'working' ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>
-                                                    {tech.name.split(' ')[1]?.charAt(0)}
-                                                </div>
-                                                <div>
-                                                    <div className="font-bold flex items-center gap-1">{tech.name} {tech.isPair && <span className="text-blue-500"><Icons.Users/></span>}</div>
-                                                    <div className={`text-xs px-2 rounded-full inline-block ${tech.status === 'working' ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>{tech.status}</div>
-                                                </div>
-                                            </div>
-                                            {tech.status === 'working' && <div className="font-mono text-blue-600 font-bold">{getElapsed(tech.startTime)}</div>}
-                                        </div>
-                                    </button>
-                                ))}
-                            </div>
-
-                            <div className="bg-white rounded-xl shadow-sm p-6 flex flex-col justify-center min-h-[300px]">
-                                {!selectedTech ? <div className="text-center text-slate-400">เลือก PST เพื่อเริ่มงาน</div> : (
-                                    <div>
-                                        <h3 className="text-2xl font-bold text-center mb-6">{selectedTech.name}</h3>
-                                        {selectedTech.status === 'idle' ? (
-                                            <div className="space-y-4">
-                                                <input type="text" value={jobInput} onChange={e => setJobInput(e.target.value)} placeholder="Job No. (RO)" className="w-full p-3 border rounded-lg text-lg focus:ring-2 focus:ring-blue-500 outline-none" autoFocus />
-                                                <div className="flex gap-2 items-center">
-                                                    <input type="number" step="0.1" value={stdTimeInput} onChange={e => setStdTimeInput(e.target.value)} placeholder="Std Time (ชม.)" className="w-full p-3 border rounded-lg text-lg outline-none" />
-                                                </div>
-                                                <select value={partnerId} onChange={e => setPartnerId(e.target.value)} className="w-full p-3 border rounded-lg bg-blue-50 text-blue-800">
-                                                    <option value="">-- ทำงานคนเดียว --</option>
-                                                    {idleTechs.map(t => <option key={t.id} value={t.id}>+ {t.name}</option>)}
-                                                </select>
-                                                <button onClick={handleStartJob} disabled={!jobInput.trim()} className="w-full bg-blue-600 text-white py-4 rounded-xl text-lg font-bold flex items-center justify-center gap-2 mt-2 disabled:bg-slate-300"><Icons.Play/> เริ่มงาน</button>
-                                            </div>
-                                        ) : (
-                                            <div className="space-y-6">
-                                                <div className="bg-blue-50 rounded-xl p-6 text-center border border-blue-100">
-                                                    <div className="text-sm text-slate-500">JOB NO.</div>
-                                                    <div className="text-2xl font-bold mb-4">{selectedTech.currentJob}</div>
-                                                    <div className="text-5xl font-mono font-bold text-blue-700 tracking-wider mb-2">{getElapsed(selectedTech.startTime)}</div>
-                                                    {selectedTech.stdTime > 0 && <div className="text-sm text-slate-500">Std: {selectedTech.stdTime} hr</div>}
-                                                </div>
-                                                <button onClick={handleStopJob} className="w-full border-2 border-red-500 text-red-500 py-4 rounded-xl text-lg font-bold flex items-center justify-center gap-2 hover:bg-red-50"><Icons.Square/> จบงาน</button>
-                                            </div>
-                                        )}
+                        {tech.status === 'working' && (
+                          <div className={`animate-pulse ${isOverTime ? 'text-red-500' : 'text-green-500'}`}>
+                             <div className={`w-2 h-2 rounded-full ${isOverTime ? 'bg-red-500' : 'bg-green-500'}`}></div>
+                          </div>
+                        )}
+                      </div>
+                      
+                      {tech.status === 'working' && (
+                        <div className="mt-3 pt-3 border-t border-slate-100">
+                          <div className="flex justify-between items-center text-sm">
+                            <span className="text-slate-500">RO: {tech.currentJob}</span>
+                            <div className="text-right">
+                                <div className={`font-mono font-medium ${isOverTime ? 'text-red-600' : 'text-blue-600'}`}>
+                                {elapsedTimeObj.text}
+                                </div>
+                                {remainingObj && (
+                                    <div className={`text-xs font-bold ${remainingObj.isOver ? 'text-red-500' : 'text-slate-400'}`}>
+                                        {remainingObj.text}
                                     </div>
                                 )}
                             </div>
+                          </div>
                         </div>
-                    )}
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
 
-                    {activeTab === 'history' && (
-                        <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                            <div className="p-4 border-b flex justify-between">
-                                <h2 className="font-bold flex items-center gap-2"><span className="text-green-500"><Icons.History/></span> ประวัติงาน</h2>
-                                {workLogs.length > 0 && <button onClick={clearLogs} className="text-red-400 text-sm flex items-center gap-1"><Icons.Trash2/> ล้าง</button>}
-                            </div>
-                            <div className="overflow-x-auto">
-                                <table className="w-full text-left text-sm">
-                                    <thead className="bg-slate-50 text-slate-500"><tr><th className="p-4">Date</th><th className="p-4">Tech</th><th className="p-4">Job</th><th className="p-4">Time</th><th className="p-4">Eff.</th></tr></thead>
-                                    <tbody className="divide-y">
-                                        {workLogs.map(log => (
-                                            <tr key={log.id}>
-                                                <td className="p-4 text-xs text-slate-400">{log.date}</td>
-                                                <td className="p-4 font-bold">{log.techName}</td>
-                                                <td className="p-4 text-blue-600">{log.jobNo}</td>
-                                                <td className="p-4">{log.durationText}</td>
-                                                <td className="p-4"><span className={`px-2 py-1 rounded text-xs font-bold ${log.efficiency >= 100 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{log.efficiency}%</span></td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    )}
-
-                    {activeTab === 'dashboard' && (
-                        <div className="space-y-4">
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                <div className="bg-white p-6 rounded-xl shadow-sm"><div className="text-slate-500 text-sm">Jobs Done</div><div className="text-3xl font-bold text-blue-600">{workLogs.length}</div></div>
-                                <div className="bg-white p-6 rounded-xl shadow-sm"><div className="text-slate-500 text-sm">Avg Efficiency</div><div className="text-3xl font-bold text-purple-600">{workLogs.length ? Math.round(workLogs.reduce((a,b)=>a+b.efficiency,0)/workLogs.length) : 0}%</div></div>
-                                <div className="bg-white p-6 rounded-xl shadow-sm"><div className="text-slate-500 text-sm">Sold Hours</div><div className="text-3xl font-bold text-green-600">{workLogs.reduce((a,b)=>a+(b.stdTime||0),0).toFixed(1)}</div></div>
-                            </div>
-                        </div>
-                    )}
+            {/* Right: Action Panel */}
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 flex flex-col justify-center min-h-[300px]">
+              {!selectedTech ? (
+                <div className="text-center text-slate-400">
+                  <User size={48} className="mx-auto mb-4 opacity-20" />
+                  <p>กรุณาเลือก PST ทางด้านซ้าย<br/>เพื่อเริ่มบันทึกงาน</p>
                 </div>
-            );
-        };
+              ) : (
+                <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+                  <div className="text-center mb-6">
+                    <h3 className="text-2xl font-bold text-slate-800 flex items-center justify-center gap-2">
+                        {selectedTech.name}
+                    </h3>
+                    <p className="text-slate-500">
+                      สถานะปัจจุบัน: <span className={selectedTech.status === 'working' ? 'text-green-600 font-bold' : 'text-slate-500'}>
+                        {selectedTech.status === 'working' ? 'กำลังปฏิบัติงาน' : 'พร้อมรับงาน'}
+                      </span>
+                    </p>
+                  </div>
 
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<TechnicianTimeTracker />);
-    </script>
-</body>
-</html>
+                  {selectedTech.status === 'idle' ? (
+                    <div className="space-y-4">
+                      {/* Job No Input */}
+                      <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-1">เลขที่ใบสั่งซ่อม (Job No.)</label>
+                        <input 
+                          type="text" 
+                          value={jobInput}
+                          onChange={(e) => setJobInput(e.target.value)}
+                          placeholder="เช่น RO-12345"
+                          className="w-full text-lg p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                          autoFocus
+                        />
+                      </div>
+
+                      {/* Partner Selection */}
+                      <div className="bg-blue-50 p-3 rounded-lg border border-blue-100">
+                          <label className="block text-sm font-medium text-blue-800 mb-2 flex items-center gap-2">
+                             <Users size={16} /> ทำงานร่วมกับ (ถ้ามี)
+                          </label>
+                          <select
+                            value={partnerId}
+                            onChange={(e) => setPartnerId(e.target.value)}
+                            className="w-full p-2 border border-blue-200 rounded-md text-sm bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                          >
+                            <option value="">-- ทำงานคนเดียว --</option>
+                            {idleTechnicians.map(t => (
+                                <option key={t.id} value={t.id}>{t.name}</option>
+                            ))}
+                          </select>
+                          {partnerId && (
+                              <p className="text-xs text-blue-600 mt-1">
+                                  * ระบบจะเริ่มจับเวลาให้ทั้ง 2 คน และหาร Labour Time คนละครึ่ง
+                              </p>
+                          )}
+                      </div>
+
+                      {/* Labour Time Input */}
+                      <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-1 flex items-center gap-2">
+                           <Timer size={14} /> Labour Time Guide (ชั่วโมง)
+                        </label>
+                        <div className="flex gap-2 items-center">
+                            <input 
+                              type="number" 
+                              step="0.1"
+                              value={stdTimeInput}
+                              onChange={(e) => setStdTimeInput(e.target.value)}
+                              placeholder="เช่น 1.5 (90 นาที)"
+                              className="w-full text-lg p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono"
+                            />
+                            <span className="text-slate-500 text-sm whitespace-nowrap">ชม. รวม</span>
+                        </div>
+                        {/* Time Converter Help Text */}
+                        {stdTimeInput && !isNaN(parseFloat(stdTimeInput)) && (
+                            <p className="text-sm text-slate-500 mt-1 flex items-center gap-1">
+                                <Hourglass size={12}/> 
+                                คิดเป็นเวลา <span className="font-bold text-blue-600">{Math.round(parseFloat(stdTimeInput) * 60)}</span> นาที 
+                                <span className="text-xs text-slate-400 ml-1">(0.1 ชม. = 6 นาที)</span>
+                            </p>
+                        )}
+                        {partnerId && stdTimeInput && (
+                            <p className="text-xs text-green-600 mt-1">
+                                (แบ่งคนละ {(parseFloat(stdTimeInput)/2).toFixed(2)} ชม.)
+                            </p>
+                        )}
+                      </div>
+
+                      <button 
+                        onClick={handleStartJob}
+                        disabled={!jobInput.trim()}
+                        className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white py-4 rounded-xl text-lg font-bold shadow-lg shadow-blue-200 flex items-center justify-center gap-2 transition-all active:scale-95 mt-2"
+                      >
+                        <Play size={24} fill="currentColor" /> 
+                        {partnerId ? 'เริ่มจับเวลาแบบคู่' : 'เริ่มจับเวลา'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      <div className={`rounded-xl p-6 text-center border relative overflow-hidden ${
+                         (() => {
+                            const elapsed = getElapsedTimeObj(selectedTech.startTime);
+                            const isOver = selectedTech.stdTime > 0 && elapsed.totalMinutes > (selectedTech.stdTime * 60);
+                            return isOver ? 'bg-red-50 border-red-200' : 'bg-blue-50 border-blue-100';
+                         })()
+                      }`}>
+                        <div className="text-sm text-slate-500 mb-1">กำลังทำงานหมายเลข</div>
+                        <div className="text-2xl font-bold text-slate-800 mb-4">{selectedTech.currentJob}</div>
+                        
+                        <div className={`text-5xl font-mono font-bold tracking-wider mb-2 ${
+                            (() => {
+                                const elapsed = getElapsedTimeObj(selectedTech.startTime);
+                                const isOver = selectedTech.stdTime > 0 && elapsed.totalMinutes > (selectedTech.stdTime * 60);
+                                return isOver ? 'text-red-600' : 'text-blue-700';
+                            })()
+                        }`}>
+                          {getElapsedTimeObj(selectedTech.startTime).text}
+                        </div>
+                        
+                        {selectedTech.partnerName && (
+                             <div className="mb-4 text-sm font-semibold text-blue-700 bg-blue-100 inline-block px-3 py-1 rounded-full">
+                                <Users size={14} className="inline mr-1"/>
+                                คู่กับ: {selectedTech.partnerName}
+                             </div>
+                        )}
+
+                        {selectedTech.stdTime > 0 && (
+                            <div className="flex justify-center gap-4 text-sm mt-2 pt-4 border-t border-black/5">
+                                <div className="text-slate-500">
+                                    Std Time: 
+                                    <span className="font-semibold text-slate-700 ml-1">
+                                        {selectedTech.isPair ? (
+                                            <>
+                                                {parseFloat((selectedTech.stdTime * 2).toFixed(2))} ÷ 2 = {selectedTech.stdTime} ชม.
+                                            </>
+                                        ) : (
+                                            <>{selectedTech.stdTime} ชม.</>
+                                        )}
+                                    </span>
+                                </div>
+                                {(() => {
+                                    const elapsed = getElapsedTimeObj(selectedTech.startTime);
+                                    const remainingObj = getRemainingTimeText(selectedTech.stdTime, elapsed.totalMinutes, selectedTech.isPair);
+                                    
+                                    if(!remainingObj) return null;
+
+                                    return remainingObj.isOver ? (
+                                        <div className="text-red-600 font-bold">{remainingObj.text}</div>
+                                    ) : (
+                                        <div className="text-green-600 font-bold">{remainingObj.text}</div>
+                                    )
+                                })()}
+                            </div>
+                        )}
+                      </div>
+                      <button 
+                        onClick={handleStopJob}
+                        className="w-full bg-white border-2 border-red-500 text-red-500 hover:bg-red-50 py-4 rounded-xl text-lg font-bold flex items-center justify-center gap-2 transition-all active:scale-95"
+                      >
+                        <Square size={24} fill="currentColor" /> จบงานนี้
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* History Tab */}
+        {activeTab === 'history' && (
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            <div className="p-4 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-center gap-4">
+              <h2 className="font-bold text-slate-800 flex items-center gap-2">
+                <CheckCircle size={20} className="text-green-500" /> ประวัติงาน
+              </h2>
+              
+              <div className="flex items-center gap-2 w-full sm:w-auto">
+                 {/* Search Box */}
+                 <div className="relative flex-1 sm:flex-initial">
+                    <Search size={16} className="absolute left-3 top-1/2 transform -translate-y-1/2 text-slate-400"/>
+                    <input 
+                      type="text" 
+                      placeholder="ค้นหา Job / ช่าง..." 
+                      value={searchTerm}
+                      onChange={(e) => setSearchTerm(e.target.value)}
+                      className="pl-9 pr-4 py-2 border border-slate-200 rounded-lg text-sm w-full focus:ring-2 focus:ring-blue-500 outline-none"
+                    />
+                 </div>
+                 
+                 {/* Export Button */}
+                 {workLogs.length > 0 && (
+                    <button 
+                        onClick={handleExportCSV}
+                        className="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-bold transition-all shadow-sm"
+                        title="Export to Excel (CSV)"
+                    >
+                        <Download size={16} /> <span className="hidden sm:inline">Export</span>
+                    </button>
+                 )}
+              </div>
+            </div>
+            
+            {filteredLogs.length === 0 ? (
+              <div className="p-8 text-center text-slate-400">
+                <AlertCircle size={32} className="mx-auto mb-2 opacity-50" />
+                {searchTerm ? 'ไม่พบข้อมูลที่ค้นหา' : 'ยังไม่มีประวัติงาน'}
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-slate-50 text-slate-500">
+                    <tr>
+                      <th className="p-4 font-medium">วันที่</th>
+                      <th className="p-4 font-medium">ช่าง</th>
+                      <th className="p-4 font-medium">Job No.</th>
+                      <th className="p-4 font-medium">Actual</th>
+                      <th className="p-4 font-medium">Std</th>
+                      <th className="p-4 font-medium text-right">Eff.</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredLogs.map(log => (
+                      <tr key={log.id} className="hover:bg-slate-50">
+                        <td className="p-4 text-slate-400 text-xs whitespace-nowrap">{log.date}</td>
+                        <td className="p-4 font-medium text-slate-800">
+                            <div className="flex flex-col">
+                                <div>{log.techName}</div>
+                                {log.isPair && log.partnerName && (
+                                    <div className="text-xs text-blue-500 flex items-center gap-1 mt-1">
+                                        <Users size={10} /> คู่กับ {log.partnerName.split(' ')[1] || log.partnerName}
+                                    </div>
+                                )}
+                            </div>
+                        </td>
+                        <td className="p-4 text-blue-600 font-mono">{log.jobNo}</td>
+                        <td className="p-4 text-slate-600">{log.durationText}</td>
+                        <td className="p-4 text-slate-500">
+                            {log.stdTime > 0 ? (
+                                log.isPair ? (
+                                    <div className="flex flex-col">
+                                        <span>{log.stdTime}</span>
+                                        <span className="text-[10px] text-slate-400">({parseFloat((log.stdTime * 2).toFixed(2))} ÷ 2)</span>
+                                    </div>
+                                ) : `${log.stdTime}`
+                            ) : '-'}
+                        </td>
+                        <td className="p-4 text-right">
+                            {log.stdTime > 0 ? (
+                                <span className={`px-2 py-1 rounded-full text-xs font-bold ${
+                                    log.efficiency >= 100 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                                }`}>
+                                    {log.efficiency}%
+                                </span>
+                            ) : (
+                                <span className="text-slate-400">-</span>
+                            )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            
+            {workLogs.length > 0 && (
+                <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end">
+                    <button onClick={clearLogs} className="text-red-400 text-xs hover:text-red-600 flex items-center gap-1">
+                        <Trash2 size={12} /> ล้างประวัติทั้งหมด (Manager Only)
+                    </button>
+                </div>
+            )}
+          </div>
+        )}
+
+        {/* Dashboard Tab */}
+        {activeTab === 'dashboard' && (
+           <div className="space-y-6">
+             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <div className="text-slate-500 text-sm mb-1">งานเสร็จทั้งหมด</div>
+                  <div className="text-3xl font-bold text-blue-600">{workLogs.length} <span className="text-sm text-slate-400 font-normal">Jobs</span></div>
+                </div>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <div className="text-slate-500 text-sm mb-1">Efficiency เฉลี่ย</div>
+                  <div className="text-3xl font-bold text-purple-600">
+                    {(() => {
+                        const logsWithStd = workLogs.filter(l => l.stdTime > 0);
+                        if (logsWithStd.length === 0) return 0;
+                        const totalEff = logsWithStd.reduce((acc, curr) => acc + curr.efficiency, 0);
+                        return Math.round(totalEff / logsWithStd.length);
+                    })()}%
+                  </div>
+                </div>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <div className="text-slate-500 text-sm mb-1">เวลารวมที่ขายได้ (Sold Hours)</div>
+                  <div className="text-3xl font-bold text-green-600">
+                      {workLogs.reduce((acc, curr) => acc + (curr.stdTime || 0), 0).toFixed(1)} <span className="text-sm text-slate-400 font-normal">ชม.</span>
+                  </div>
+                </div>
+             </div>
+
+             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+               <h3 className="font-bold text-slate-800 mb-4">สรุปงานแยกตาม PST</h3>
+               <div className="space-y-4">
+                 {technicians.map(tech => {
+                   const techLogs = workLogs.filter(l => l.techId === tech.id);
+                   const jobCount = techLogs.length;
+                   const soldHours = techLogs.reduce((acc, curr) => acc + (curr.stdTime || 0), 0);
+                   
+                   return (
+                     <div key={tech.id} className="flex items-center gap-4">
+                       <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center text-xs font-bold text-slate-600">
+                          {/* ใช้อักษรตัวแรกของชื่อจริงมาแสดงเป็น Icon */}
+                          {tech.name.split(' ')[1]?.charAt(0) || 'P'}
+                       </div>
+                       <div className="flex-1">
+                         <div className="flex justify-between mb-1">
+                            <span className="text-sm font-medium">{tech.name}</span>
+                            <div className="text-right">
+                                <span className="text-sm text-slate-900 font-bold mr-3">{soldHours.toFixed(1)} Sold Hrs</span>
+                                <span className="text-sm text-slate-500">{jobCount} งาน</span>
+                            </div>
+                         </div>
+                         <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+                           <div 
+                              className="h-full bg-blue-500 rounded-full" 
+                              style={{ width: `${Math.min(jobCount * 10, 100)}%` }}
+                           ></div>
+                         </div>
+                       </div>
+                     </div>
+                   )
+                 })}
+               </div>
+             </div>
+           </div>
+        )}
+
+      </main>
+    </div>
+  );
+};
+
+export default TechnicianTimeTracker;
